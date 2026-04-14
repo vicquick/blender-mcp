@@ -1,0 +1,17 @@
+Blender MCP — aec-web fork
+===========================
+
+This repository is a fork of https://github.com/ahujasid/blender-mcp (MIT licensed).
+
+Upstream author: Siddharth Ahuja (@ahujasid)
+Upstream license: MIT (see LICENSE)
+
+Additions in the `aec/` directory (plugin + server + Dockerfile) are authored
+by Victor (@vicquick) with AI assistance (Claude Sonnet 4.6 / Opus 4.6
+by Anthropic) and are released under the same MIT license as upstream.
+
+The original upstream files (addon.py, src/, main.py, pyproject.toml, etc.) are
+preserved unchanged under their upstream MIT license.
+
+Original Blender MCP concept and socket-based architecture: ahujasid/blender-mcp.
+Our modular handler architecture and Bonsai BIM integration: novel additions.

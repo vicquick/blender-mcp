@@ -1,3 +1,19 @@
+# ⚠️ aec-web fork notice — this ToS does NOT apply to our deployment
+
+> **The telemetry and data-collection described below belong to the upstream project** ([ahujasid/blender-mcp](https://github.com/ahujasid/blender-mcp)). The upstream's `addon.py` is preserved in this repo for reference only — **it is not installed by our deployment workflow**.
+>
+> This fork's addon lives in [`aec/plugin/`](./aec/) — a modular rewrite with **zero telemetry, zero phone-home, zero data collection**. Verify:
+>
+> ```bash
+> grep -riE 'telemetry|requests\.(get|post)|urllib' aec/plugin/   # returns nothing
+> ```
+>
+> If you install this fork via our Dockerfile (`desktop/Dockerfile` in [aec-web](https://github.com/vicquick/aec-web)), only `aec/plugin/` is copied into Blender's addons folder. The upstream `addon.py` is never loaded.
+>
+> The document below is the original upstream Terms of Use, preserved unchanged for transparency. It applies **only** if you install `addon.py` from the repo root yourself.
+
+---
+
 # Blender MCP - Terms of Use and Privacy Policy
 
 **Last Updated: January 2025**
