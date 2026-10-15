@@ -7,8 +7,13 @@ Connects to the Blender MCP plugin running inside the desktop container.
 import os
 import logging
 from contextlib import asynccontextmanager
+import asyncio
+import select
 import socket
 import json
+import threading
+import time
+import uuid
 from typing import AsyncIterator, Dict, Any, Optional
 # Migrated bundled mcp.server.fastmcp -> standalone fastmcp 4.x: the bundled
 # build has no tags, no per-tool timeout and no middleware, so toolset
@@ -28,8 +33,29 @@ BLENDER_PORT = int(os.environ.get("BLENDER_PORT", "9876"))
 # Per-call timeout applied to every tool (qtool's default, overridable per
 # tool). A render_animation over many frames is the long pole here; this
 # just needs to clear whatever a client's own idle-abort window is, which
-# ProgressHeartbeatMiddleware (wave 2) covers for anything slower still.
+# ProgressHeartbeatMiddleware (wave 2, below) covers for anything slower
+# still.
 BLENDER_CALL_TIMEOUT = float(os.environ.get("BLENDER_CALL_TIMEOUT", "300"))
+
+# Socket read timeout towards the in-Blender plugin. A Blender main thread
+# busy inside a long Cycles render means recv() would otherwise block
+# forever, wedging the whole MCP session behind one call.
+BLENDER_SOCKET_TIMEOUT = float(os.environ.get("BLENDER_SOCKET_TIMEOUT", "180"))
+# uvicorn's default idle keep-alive is 5s, so two tool calls spaced further
+# apart than that race the server's FIN on the idle connection — the
+# sporadic "Unable to connect" that succeeds instantly on retry (same trap
+# qgis-mcp's own migration documents and works around the same way).
+BLENDER_KEEPALIVE = int(os.environ.get("BLENDER_KEEPALIVE", "600"))
+# Progress heartbeat interval (wave 2 middleware, below). 0 disables.
+BLENDER_HEARTBEAT = float(os.environ.get("BLENDER_HEARTBEAT", "20"))
+# Read-only response cache TTL (wave 2 middleware, below), applied only to
+# the allowlist that middleware computes. 0 disables.
+BLENDER_CACHE_TTL = int(os.environ.get("BLENDER_CACHE_TTL", "30"))
+# Optional shared secret. NOT enforced yet — see the TODO on
+# BLENDER_MCP_TOKEN near _install_middleware for why this is read but unused:
+# left here so a later wave's HTTP-auth middleware has the env contract
+# already in place without another round of Docker/Coolify env-var changes.
+BLENDER_MCP_TOKEN = os.environ.get("BLENDER_MCP_TOKEN", "")
 
 # MCP_TRACE_DIR-gated session trace (folded in from the April hot-patch at
 # /opt/aec-web/data/mcp-patches/blender/blender_mcp_server.py — 6 days proven
@@ -46,72 +72,144 @@ class BlenderConnection:
         self.host = host
         self.port = port
         self.socket = None
+        self.last_cid = None
+        # One socket is shared by tools that may run concurrently in
+        # fastmcp's threadpool. Without this lock two calls interleave their
+        # sendall and recv on the same stream and corrupt it — same reason
+        # qgis-mcp's own QgisMCPServer carries this lock.
+        self._lock = threading.Lock()
 
     def connect(self):
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(BLENDER_SOCKET_TIMEOUT)
             self.socket.connect((self.host, self.port))
             return True
         except Exception as e:
             logger.error(f"Error connecting to Blender: {e}")
+            self.socket = None
             return False
 
     def disconnect(self):
         if self.socket:
-            self.socket.close()
+            try: self.socket.close()
+            except Exception: pass
             self.socket = None
 
     def send_command(self, command_type, params=None):
-        """Send a newline-delimited JSON command and read the newline-delimited response."""
-        if not self.socket:
-            return None
-        command = {"type": command_type, "params": params or {}}
+        """Send newline-delimited JSON, read newline-delimited response.
+
+        Serialized end to end (self._lock), with a correlation id and
+        latency per call so a slow tool can be told apart from a stuck one
+        in the log — same shape as qgis-mcp's own send_command.
+        """
+        cid = uuid.uuid4().hex[:8]
+        # Exposed so cmd() can log it against the response without this
+        # method having to change its return shape — a genuine Blender
+        # response passes through byte-for-byte below, cid included only in
+        # the synthetic dicts this method builds itself (timeout/gone/no
+        # connection), same as qgis-mcp's own send_command.
+        self.last_cid = cid
+        command = {"type": command_type, "params": params or {}, "_cid": cid}
+        payload = json.dumps(command).encode("utf-8") + b"\n"
+        t0 = time.perf_counter()
         try:
-            self.socket.sendall(json.dumps(command).encode('utf-8') + b'\n')
-            response_data = b''
-            while True:
-                chunk = self.socket.recv(65536)
-                if not chunk:
-                    break
-                response_data += chunk
-                if b'\n' in response_data:
-                    line = response_data.split(b'\n', 1)[0]
-                    return json.loads(line.decode('utf-8'))
-            if response_data.strip():
-                return json.loads(response_data.strip().decode('utf-8'))
-            return None
+            with self._lock:
+                # Probe for a dead or desynced stream BEFORE sending. When the
+                # Blender addon restarts (or its socket server is stopped),
+                # its FIN leaves this socket readable with recv() returning
+                # b"" — yet sendall() still "succeeds" into the local buffer,
+                # so the failure used to surface only as a None/empty
+                # response AND the poisoned socket was kept for the next
+                # call (the old get_connection() used `socket.sendall(b'')`
+                # as its liveness check, which never fails even on a dead
+                # socket — sending zero bytes always "succeeds"). select()
+                # actually distinguishes "nothing to read yet" from "the
+                # peer already closed", which sendall(b'') cannot.
+                if self.socket is not None:
+                    try:
+                        readable, _, _ = select.select([self.socket], [], [], 0)
+                        if readable:
+                            if not self.socket.recv(65536):
+                                raise ConnectionError("peer closed (Blender restarted?)")
+                            raise ConnectionError("stale bytes on stream")
+                    except Exception as pe:
+                        logger.warning(f"tool={command_type} cid={cid} dropping dead socket ({pe})")
+                        self.disconnect()
+                # A stale socket (addon restarted, idle RST) fails on SEND
+                # before Blender has seen anything, so one reconnect and
+                # resend is safe here. Never retry after a send succeeds:
+                # the command may already be running and a repeat would
+                # double-apply an edit.
+                try:
+                    if not self.socket:
+                        raise ConnectionError("no socket")
+                    self.socket.sendall(payload)
+                except Exception as se:
+                    logger.warning(f"tool={command_type} cid={cid} stale socket ({se}) — reconnecting")
+                    self.disconnect()
+                    if not self.connect():
+                        return {"error": f"Could not connect to Blender at {self.host}:{self.port}. "
+                                         "Is the Blender MCP plugin started?", "cid": cid}
+                    self.socket.sendall(payload)
+                response_data = b""
+                result = None
+                while True:
+                    chunk = self.socket.recv(65536)
+                    if not chunk:
+                        break
+                    response_data += chunk
+                    if b"\n" in response_data:
+                        result = json.loads(response_data.split(b"\n", 1)[0].decode("utf-8"))
+                        break
+                if result is None:
+                    if response_data.strip():
+                        result = json.loads(response_data.strip().decode("utf-8"))
+                    else:
+                        # Peer closed without a reply: the connection is
+                        # unusable and MUST be dropped, or every later call
+                        # inherits it.
+                        self.disconnect()
+                        result = {"error": "Blender closed the connection without a reply "
+                                           "(plugin stopped or Blender restarted?) — retry the call.",
+                                  "cid": cid, "code": "BLENDER_GONE"}
+            ms = (time.perf_counter() - t0) * 1000
+            status = "err" if isinstance(result, dict) and result.get("status") == "error" else "ok"
+            logger.info(f"tool={command_type} cid={cid} ms={ms:.0f} status={status}")
+            return result
+        except socket.timeout:
+            self.disconnect()
+            logger.error(f"tool={command_type} cid={cid} status=timeout")
+            return {"error": f"timed out after {BLENDER_SOCKET_TIMEOUT:.0f}s — the Blender main thread is "
+                             "busy (long render, or a modal dialog is open). The command may still "
+                             "complete in Blender.", "cid": cid, "code": "BLENDER_BUSY"}
         except Exception as e:
-            logger.error(f"Error sending command: {e}")
-            return None
+            self.disconnect()
+            logger.error(f"tool={command_type} cid={cid} status=exc err={e}")
+            return {"error": str(e), "cid": cid}
 
 
 _connection = None
 
 def get_connection():
     global _connection
-    if _connection is not None:
-        try:
-            _connection.socket.sendall(b'')
-            return _connection
-        except Exception:
-            try: _connection.disconnect()
-            except Exception: pass
-            _connection = None
-    _connection = BlenderConnection()
+    if _connection is not None and _connection.socket is not None:
+        return _connection
+    if _connection is None:
+        _connection = BlenderConnection()
     if not _connection.connect():
-        _connection = None
         raise Exception(f"Could not connect to Blender at {BLENDER_HOST}:{BLENDER_PORT}. Start the plugin first.")
     logger.info(f"Connected to Blender at {BLENDER_HOST}:{BLENDER_PORT}")
     return _connection
 
 
-def _log_trace(command_type, params, response):
+def _log_trace(command_type, params, response, cid=None):
     if not _TRACE_DIR:
         return
     try:
         from datetime import datetime, timezone
         entry = {"ts": datetime.now(timezone.utc).isoformat(), "mcp": "blender",
-                 "tool": command_type, "args": params, "response": response}
+                 "tool": command_type, "cid": cid, "args": params, "response": response}
         fn = f"{_TRACE_DIR}/trace-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.jsonl"
         with open(fn, "a") as f:
             f.write(json.dumps(entry, default=str)[:8192] + "\n")
@@ -121,8 +219,9 @@ def _log_trace(command_type, params, response):
 
 def cmd(command_type, params=None):
     """Send command and return JSON string."""
-    response = get_connection().send_command(command_type, params)
-    _log_trace(command_type, params, response)
+    conn = get_connection()
+    response = conn.send_command(command_type, params)
+    _log_trace(command_type, params, response, conn.last_cid)
     return json.dumps(response, indent=2)
 
 
@@ -1604,10 +1703,115 @@ def search_rules(ctx: Context, query: str = None, limit: int = 5) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Middleware
+# ═══════════════════════════════════════════════════════════════════
+
+from fastmcp.server.middleware import Middleware
+
+
+class ProgressHeartbeatMiddleware(Middleware):
+    """Emit a progress notification while a tool call is still outstanding.
+
+    A heavy Cycles render over many frames legitimately runs for minutes.
+    Without a heartbeat the client aborts it as idle, and a call the client
+    has backgrounded is indistinguishable from a hung one.
+
+    The tool bodies are synchronous — they block in the threadpool on the
+    socket — so they cannot await anything themselves. Doing this in async
+    middleware leaves all 152 of them unchanged. Direct port of qgis-mcp's
+    own ProgressHeartbeatMiddleware.
+    """
+
+    def __init__(self, interval: float = 20.0):
+        self.interval = interval
+
+    async def on_call_tool(self, context, call_next):
+        ctx = getattr(context, "fastmcp_context", None)
+        if ctx is None or self.interval <= 0:
+            return await call_next(context)
+        task = asyncio.ensure_future(call_next(context))
+        waited = 0.0
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=self.interval)
+            if done:
+                break
+            waited += self.interval
+            try:
+                # No total: Blender does not report percent-complete through
+                # this transport, and a made-up denominator renders as a
+                # lying bar.
+                await ctx.report_progress(progress=waited)
+            except Exception:
+                pass
+        return await task
+
+
+# Tools whose answers are safe to serve from a short-lived cache: every
+# get_*/list_*/bim_get_*/bim_list_* tool plus bim_query_elements, per the
+# wave-1 scope — computed from _TOOL_INDEX (built by qtool at import time)
+# rather than hand-transcribed, so this can never drift the way qgis-mcp's
+# own _CACHEABLE list once did (two names in it that no tool had).
+#
+# get_viewport_screenshot matches the get_ prefix but is NOT read-only in the
+# sense this cache needs: every call captures a NEW screenshot to disk as a
+# side effect, so serving a cached JSON response would skip that capture
+# while claiming it happened. Excluded explicitly rather than silently
+# wrong — same shape as qgis-mcp excluding render_map from its own
+# equivalent allowlist despite it also writing a file.
+_CACHE_EXCLUDE = frozenset({"get_viewport_screenshot"})
+
+
+def _cacheable_tools():
+    return sorted(
+        n for n in _TOOL_INDEX
+        if n not in _CACHE_EXCLUDE
+        and (n.startswith(("get_", "list_", "bim_get_", "bim_list_")) or n == "bim_query_elements")
+    )
+
+
+def _install_middleware():
+    from fastmcp.server.middleware.timing import TimingMiddleware
+    mcp.add_middleware(TimingMiddleware())
+    if BLENDER_HEARTBEAT > 0:
+        mcp.add_middleware(ProgressHeartbeatMiddleware(BLENDER_HEARTBEAT))
+        logger.info(f"progress heartbeat every {BLENDER_HEARTBEAT:.0f}s")
+    if BLENDER_CACHE_TTL > 0:
+        try:
+            from fastmcp.server.middleware.caching import ResponseCachingMiddleware
+            cacheable = _cacheable_tools()
+            mcp.add_middleware(ResponseCachingMiddleware(
+                call_tool_settings={"enabled": True, "ttl": BLENDER_CACHE_TTL,
+                                    "included_tools": cacheable},
+                # tools/list is deliberately NOT cached: set_toolset changes
+                # the visible surface, and a cached catalogue would keep
+                # serving the pre-switch tool set until the TTL expired.
+                list_tools_settings={"enabled": False},
+                list_resources_settings={"enabled": False},
+                list_prompts_settings={"enabled": False},
+                read_resource_settings={"enabled": False},
+                get_prompt_settings={"enabled": False},
+            ))
+            logger.info(f"response cache on for {len(cacheable)} read-only tools "
+                        f"(ttl {BLENDER_CACHE_TTL}s)")
+        except Exception as e:
+            logger.warning(f"response caching unavailable: {e}")
+    # BLENDER_MCP_TOKEN (read above, into the module-level constant) is not
+    # enforced anywhere yet. It needs an HTTP-layer check here — a Middleware
+    # (or a Starlette layer fastmcp exposes for the streamable-http app) that
+    # reads a header BEFORE a tool call is dispatched and 401s if it doesn't
+    # match. That requires no addon change (the token never reaches the
+    # Blender socket — the addon has no concept of it), so it is in-scope for
+    # a later wave; this one stops at making the env var exist so Coolify
+    # config doesn't need touching twice. TODO(wave 3+): add that middleware.
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Entry Point
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
+    _install_middleware()
+
     # BLENDER_TOOLSET=generic_blender|bim_authoring|bim_costing|rendering|minimal|full (default full).
     sel = os.environ.get("BLENDER_TOOLSET", "full")
     tags = preset_tags(sel)
@@ -1627,6 +1831,10 @@ def main():
             transport=transport,
             host=os.environ.get("FASTMCP_HOST", "0.0.0.0"),
             port=int(os.environ.get("FASTMCP_PORT", "8082")),
+            # uvicorn's default idle keep-alive is 5s (see BLENDER_KEEPALIVE
+            # above) — two tool calls spaced further apart raced the
+            # server's FIN on the idle connection.
+            uvicorn_config={"timeout_keep_alive": BLENDER_KEEPALIVE},
         )
     else:
         mcp.run(transport=transport)
