@@ -1,1 +1,16 @@
-mcp[cli]>=1.3.0
+# blender-mcp server deps. Migrated bundled mcp.server.fastmcp -> standalone
+# fastmcp 4.x: the bundled build has no tags, no per-tool timeout and no
+# middleware, so toolset presets, call timeouts, response caching and the
+# progress heartbeat were all unreachable. This file used to pin only
+# "mcp[cli]>=1.3.0" with no floor on anything standalone — a clean build
+# pulled whatever fastmcp was newest that day. Pinned exact from here on:
+# "next rebuild breaks" dies with the float.
+#
+# 4.0.3 (2026-10): same pin qgis-mcp carries. The risk is output-schema
+# handling, where the `output_schema=None` in _tool()/qtool() lives — without
+# it every tool emits an outputSchema derived from its `-> str` return, and
+# clients have historically dropped the whole tool set over it. Verified
+# after pinning: tools/list = 147 tools (+ meta tools from wave 1), 0 with
+# outputSchema, in-process and over streamable-HTTP on :8082.
+# Re-verify tools/list emits no outputSchema before moving this pin again.
+fastmcp==4.0.3

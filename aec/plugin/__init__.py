@@ -11,7 +11,7 @@ bl_info = {
     "version": (2, 0, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > MCP",
-    "description": "MCP socket server for AI control of Blender + Bonsai BIM (134 tools)",
+    "description": "MCP socket server for AI control of Blender + Bonsai BIM (147 tools)",
     "category": "Interface",
 }
 
