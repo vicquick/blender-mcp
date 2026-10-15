@@ -40,7 +40,30 @@ BLENDER_CALL_TIMEOUT = float(os.environ.get("BLENDER_CALL_TIMEOUT", "300"))
 # Socket read timeout towards the in-Blender plugin. A Blender main thread
 # busy inside a long Cycles render means recv() would otherwise block
 # forever, wedging the whole MCP session behind one call.
-BLENDER_SOCKET_TIMEOUT = float(os.environ.get("BLENDER_SOCKET_TIMEOUT", "180"))
+#
+# Review defect #3 (fastmcp4-ausbau wave 2): this used to default to a FIXED
+# 180s, shorter than BLENDER_CALL_TIMEOUT's own 300s default. The wire
+# protocol is request/single-reply with no partial-progress bytes, so a real
+# render past 180s hit socket.timeout and returned BLENDER_BUSY ("retry the
+# call") while the render kept running inside Blender regardless (closing
+# this socket does not stop it) — an agent following that advice starts a
+# second concurrent render. Worse, since the socket timeout fired first, the
+# per-tool call timeout and ProgressHeartbeatMiddleware below never got a
+# chance to matter for the exact case they exist for. Default now floats
+# BLENDER_SOCKET_TIMEOUT_MARGIN above the call timeout so the ordering holds
+# even when BLENDER_CALL_TIMEOUT is raised via env; an explicit
+# BLENDER_SOCKET_TIMEOUT still overrides this outright for an operator who
+# wants a different number.
+BLENDER_SOCKET_TIMEOUT_MARGIN = float(os.environ.get("BLENDER_SOCKET_TIMEOUT_MARGIN", "60"))
+BLENDER_SOCKET_TIMEOUT = float(os.environ.get(
+    "BLENDER_SOCKET_TIMEOUT", str(BLENDER_CALL_TIMEOUT + BLENDER_SOCKET_TIMEOUT_MARGIN)))
+if BLENDER_SOCKET_TIMEOUT <= BLENDER_CALL_TIMEOUT:
+    logger.warning(
+        f"BLENDER_SOCKET_TIMEOUT ({BLENDER_SOCKET_TIMEOUT:.0f}s) <= BLENDER_CALL_TIMEOUT "
+        f"({BLENDER_CALL_TIMEOUT:.0f}s) — a call that legitimately runs past the socket "
+        "timeout will report BLENDER_BUSY and suggest a retry while Blender keeps working "
+        "on the first one. Raise BLENDER_SOCKET_TIMEOUT above BLENDER_CALL_TIMEOUT."
+    )
 # uvicorn's default idle keep-alive is 5s, so two tool calls spaced further
 # apart than that race the server's FIN on the idle connection — the
 # sporadic "Unable to connect" that succeeds instantly on retry (same trap
@@ -260,10 +283,30 @@ from blender_paths import jail_or_error  # noqa: F401 (used at tool call sites b
 # ── Tool classification ────────────────────────────────────────────
 # Derived from the tool name at registration, so adding a tool stays a
 # one-decorator affair. Same heuristic shape as qgis_mcp_server.py.
-_RO_PREFIXES = ("get_", "list_", "describe_", "search_")
-# ping is a liveness probe (read-only); the rest are grouped by their own
-# section header above despite not matching a get_/list_ prefix.
-_RO_NAMES = frozenset({"ping"})
+#
+# _STATE_READ_PREFIXES/_STATE_READ_NAMES is the single source of truth for
+# "this tool's result reflects live Blender/IFC state and nothing else —
+# call it again, get the current answer, never a side effect." Both the
+# readOnlyHint/idempotentHint annotation below AND the response-cache
+# allowlist (_cacheable_tools, near the middleware section further down)
+# are built from this pair. Review defect #2 (fastmcp4-ausbau wave 2): those
+# two used to be independently hand-maintained lists that disagreed on
+# exactly the 16 bim_get_*/bim_list_*/bim_query_elements tools — the
+# annotation said "not safe to retry" on tools the cache middleware was (and
+# is) correctly serving from a 30s TTL cache. One tuple, reused both places,
+# so they cannot drift apart again.
+_STATE_READ_PREFIXES = ("get_", "list_", "bim_get_", "bim_list_")
+_STATE_READ_NAMES = frozenset({"bim_query_elements"})
+# Read-only for ANNOTATION purposes additionally covers the meta-discovery
+# prefixes (search_tools/describe_tool/search_rules query static tool/rule
+# metadata, not Blender state) and the ping liveness probe. Deliberately NOT
+# folded into _STATE_READ_PREFIXES/_STATE_READ_NAMES above: ping's whole
+# point is telling a live connection from a dead one, and caching that
+# would serve a stale "still connected" after Blender drops off; describe_/
+# search_ tools don't touch the Blender socket at all, so caching them adds
+# nothing the Blender-state cache's TTL/invalidation contract is about.
+_RO_PREFIXES = _STATE_READ_PREFIXES + ("describe_", "search_")
+_RO_NAMES = frozenset({"ping"}) | _STATE_READ_NAMES
 _DESTRUCTIVE_PREFIXES = ("delete_", "remove_", "clear_")
 # Destructive without the prefix: replaces the whole scene/file, runs
 # arbitrary input, or permanently collapses geometry (see blender_rules.py's
@@ -1590,7 +1633,50 @@ def run_tool(ctx: Context, name: str, arguments: dict = None):
     """Run any blender-mcp tool by name with a JSON object of arguments —
     also tools the current toolset does not load. Arguments are checked
     against the tool's parameters first: an unknown or missing one is an
-    error that lists the valid ones, never a silent fallback to defaults."""
+    error that lists the valid ones, never a silent fallback to defaults.
+
+    This calls the dispatched tool's plain Python function directly, not
+    through FastMCP's own tools/call pipeline (review defect #4,
+    fastmcp4-ausbau wave 2) — confirmed in the server log, where a
+    run_tool-wrapped call produces exactly one "tools/call completed" entry,
+    for run_tool itself, never for the tool it dispatches to. The
+    consequences, checked live against each of the three middlewares this
+    server installs:
+      - Path jail: unaffected either way — jail_or_error() runs inline in
+        the dispatched tool's own body, so it applies whether that body is
+        reached directly or through run_tool.
+      - Progress heartbeat: unaffected — proven with a 3.5s fake-Blender
+        render dispatched through run_tool under a 1s heartbeat interval,
+        which produced 3 progress notifications. The middleware wraps
+        call_next() for whichever tool NAME the client invoked (here,
+        "run_tool" itself), and that wrapped call does not return until
+        run_tool's own synchronous body — dispatched tool included — is
+        done, so the heartbeat's asyncio.wait(..., timeout=interval) loop
+        keeps firing around the whole thing regardless of what is inside.
+      - Response cache (BlenderStateCacheMiddleware): "run_tool" is not
+        itself in the cacheable set, so every run_tool call still bumps the
+        invalidation generation (same as any other non-cacheable tool) —
+        a mutation dispatched THROUGH run_tool still invalidates the cache
+        correctly. What IS lost: a read dispatched through run_tool never
+        consults or populates the cache for the tool it names, so repeated
+        get_scene_info-via-run_tool calls always make a fresh Blender round
+        trip. Safe (never stale), just slower than calling the tool by name.
+      - Per-tool timeout: this IS a real, if currently latent, gap. The
+        `timeout=` qtool sets per tool is enforced against the NAMED tool a
+        client calls — here that name is always "run_tool", never the
+        dispatched tool's own registration. Every @qtool site today shares
+        the same BLENDER_CALL_TIMEOUT default, so there is no live
+        discrepancy to observe; but a future tool given its own longer
+        timeout (a slow bim_validate_ifc/bim_run_ids_check, say) would get
+        that longer budget when called directly and only run_tool's
+        (shorter, generic) one when reached through run_tool. Flagging this
+        in the open rather than fixing it now: routing run_tool through
+        FastMCP's own call_tool() entrypoint to pick up the dispatched
+        tool's own timeout would need it to become async and re-enter the
+        middleware chain recursively (run_tool is itself a tool call), which
+        is a larger change than this fix round's verification budget covers
+        safely. Revisit if/when a tool actually needs a bespoke timeout.
+    """
     if name in ("run_tool",):
         return json.dumps({"error": "run_tool cannot run itself"})
     t = _TOOL_INDEX.get(name)
@@ -1750,23 +1836,104 @@ class ProgressHeartbeatMiddleware(Middleware):
 # get_*/list_*/bim_get_*/bim_list_* tool plus bim_query_elements, per the
 # wave-1 scope — computed from _TOOL_INDEX (built by qtool at import time)
 # rather than hand-transcribed, so this can never drift the way qgis-mcp's
-# own _CACHEABLE list once did (two names in it that no tool had).
+# own _CACHEABLE list once did (two names in it that no tool had). Built
+# from _STATE_READ_PREFIXES/_STATE_READ_NAMES (defined once, up with the
+# other tool-classification sets) rather than its own copy of the prefixes —
+# that second copy is exactly how defect #2 (readOnlyHint disagreeing with
+# this allowlist on 16 bim_get_*/bim_list_*/bim_query_elements tools) got in.
 #
 # get_viewport_screenshot matches the get_ prefix but is NOT read-only in the
 # sense this cache needs: every call captures a NEW screenshot to disk as a
 # side effect, so serving a cached JSON response would skip that capture
-# while claiming it happened. Excluded explicitly rather than silently
-# wrong — same shape as qgis-mcp excluding render_map from its own
-# equivalent allowlist despite it also writing a file.
-_CACHE_EXCLUDE = frozenset({"get_viewport_screenshot"})
+# while claiming it happened. ping matches no prefix here but is excluded on
+# the same principle were it ever added to _STATE_READ_NAMES: its whole job
+# is telling a live connection from a dead one, which a cache would defeat.
+# Both excluded explicitly rather than silently wrong — same shape as
+# qgis-mcp excluding render_map from its own equivalent allowlist despite it
+# also writing a file.
+_CACHE_EXCLUDE = frozenset({"get_viewport_screenshot", "ping"})
 
 
 def _cacheable_tools():
     return sorted(
         n for n in _TOOL_INDEX
         if n not in _CACHE_EXCLUDE
-        and (n.startswith(("get_", "list_", "bim_get_", "bim_list_")) or n == "bim_query_elements")
+        and (n.startswith(_STATE_READ_PREFIXES) or n in _STATE_READ_NAMES)
     )
+
+
+class BlenderStateCacheMiddleware(Middleware):
+    """TTL cache for the read-only Blender-state tools in `cacheable`, with
+    write-invalidation — fix for review defect #1 (fastmcp4-ausbau wave 2).
+
+    fastmcp's own `fastmcp.server.middleware.caching.ResponseCachingMiddleware`
+    (what this replaces) has no hook that fires when a DIFFERENT tool call
+    mutates Blender state in between two reads of the same cache key — its
+    key is a hash of (auth, tool, version, arguments) alone. Proven live
+    against a fake Blender addon that tags each real dispatch with a call
+    counter: two identical `get_scene_info()` calls around a `create_object()`
+    both returned `call_number: 1` — the second read never reached Blender,
+    the cache served the PRE-mutation answer. The single most common agent
+    pattern, mutate then read back to confirm, could silently see stale
+    state for up to BLENDER_CACHE_TTL seconds (duplicate-create, "my edit
+    didn't take," or a stale `bim_query_elements`/`bim_get_spatial_tree`
+    snapshot driving a bad decision).
+
+    Every call to a tool NOT in `cacheable` bumps a generation counter
+    BEFORE `call_next` runs (so a mutation still in flight invalidates reads
+    that land while it is running, not only ones issued after it returns); a
+    stored entry is served only while its TTL has not elapsed AND the
+    generation has not moved since it was cached. This also covers `run_tool`
+    and `execute_code`: neither is in the cacheable set, so EVERY call to
+    either bumps the generation regardless of what `run_tool` dispatches
+    internally — correctness over cache-hit-rate for anything this server
+    cannot otherwise classify.
+
+    Built in-house rather than monkeypatching invalidation onto fastmcp's own
+    middleware: that class exposes no public way to force-expire a key or
+    feed it an external generation/version value without reaching into its
+    private key-building functions. An in-house cache keeps the same TTL
+    contract (and the same `_cacheable_tools()` allowlist) in the open
+    instead.
+    """
+
+    def __init__(self, cacheable, ttl):
+        self._cacheable = frozenset(cacheable)
+        self._ttl = float(ttl)
+        self._generation = 0
+        self._store: Dict[Any, Any] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _args_key(arguments):
+        return json.dumps(arguments or {}, sort_keys=True, default=str, ensure_ascii=False)
+
+    async def on_call_tool(self, context, call_next):
+        name = context.message.name
+        if name not in self._cacheable:
+            with self._lock:
+                self._generation += 1
+            return await call_next(context)
+
+        key = (name, self._args_key(context.message.arguments))
+        now = time.monotonic()
+        with self._lock:
+            hit = self._store.get(key)
+            if hit is not None:
+                expires_at, generation, cached_result = hit
+                if expires_at > now and generation == self._generation:
+                    return cached_result
+
+        result = await call_next(context)
+        # Never cache an error result, or a multi-round-trip ask (SEP-2322,
+        # which answers True on this fastmcp build's ToolResult subclasses
+        # via is_error only for the former — a continuation leg is filtered
+        # out by it simply never matching a stored key's generation/TTL on
+        # its own distinct arguments, same as a fresh call would).
+        if not getattr(result, "is_error", False):
+            with self._lock:
+                self._store[key] = (now + self._ttl, self._generation, result)
+        return result
 
 
 def _install_middleware():
@@ -1776,25 +1943,10 @@ def _install_middleware():
         mcp.add_middleware(ProgressHeartbeatMiddleware(BLENDER_HEARTBEAT))
         logger.info(f"progress heartbeat every {BLENDER_HEARTBEAT:.0f}s")
     if BLENDER_CACHE_TTL > 0:
-        try:
-            from fastmcp.server.middleware.caching import ResponseCachingMiddleware
-            cacheable = _cacheable_tools()
-            mcp.add_middleware(ResponseCachingMiddleware(
-                call_tool_settings={"enabled": True, "ttl": BLENDER_CACHE_TTL,
-                                    "included_tools": cacheable},
-                # tools/list is deliberately NOT cached: set_toolset changes
-                # the visible surface, and a cached catalogue would keep
-                # serving the pre-switch tool set until the TTL expired.
-                list_tools_settings={"enabled": False},
-                list_resources_settings={"enabled": False},
-                list_prompts_settings={"enabled": False},
-                read_resource_settings={"enabled": False},
-                get_prompt_settings={"enabled": False},
-            ))
-            logger.info(f"response cache on for {len(cacheable)} read-only tools "
-                        f"(ttl {BLENDER_CACHE_TTL}s)")
-        except Exception as e:
-            logger.warning(f"response caching unavailable: {e}")
+        cacheable = _cacheable_tools()
+        mcp.add_middleware(BlenderStateCacheMiddleware(cacheable, BLENDER_CACHE_TTL))
+        logger.info(f"response cache on for {len(cacheable)} read-only tools "
+                    f"(ttl {BLENDER_CACHE_TTL}s, invalidated on any other tool call)")
     # BLENDER_MCP_TOKEN (read above, into the module-level constant) is not
     # enforced anywhere yet. It needs an HTTP-layer check here — a Middleware
     # (or a Starlette layer fastmcp exposes for the streamable-http app) that

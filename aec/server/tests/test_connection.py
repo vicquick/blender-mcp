@@ -216,3 +216,184 @@ def test_get_connection_reuses_live_socket_without_a_probe_write(fresh_connectio
         assert conn1 is conn2 is bms._connection, "a live connection should be reused, not recreated"
     finally:
         addon.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Wave 2 review fix: BlenderStateCacheMiddleware (defect #1) and the single
+# source of truth it shares with the readOnlyHint annotation (defect #2).
+#
+# Appended to this file (rather than a separate test module) deliberately:
+# these tests import `bms` too, and blender_mcp_server.py reads
+# BLENDER_SOCKET_TIMEOUT into a module-level constant on its FIRST import
+# anywhere in the test session (see the os.environ.setdefault at the top of
+# this file) — a second test module importing it first, before that
+# setdefault runs, would bake in a different value and break
+# test_busy_main_thread_times_out_with_busy_code above. Living in the same
+# file sidesteps that import-order trap entirely.
+# ═══════════════════════════════════════════════════════════════════
+
+import asyncio
+
+
+class _FakeToolMessage:
+    def __init__(self, name, arguments=None):
+        self.name = name
+        self.arguments = arguments
+
+
+class _FakeToolContext:
+    def __init__(self, name, arguments=None):
+        self.message = _FakeToolMessage(name, arguments)
+
+
+class _FakeToolResult:
+    """Stands in for fastmcp's ToolResult: the middleware only ever reads
+    `.is_error` off it and otherwise treats it as an opaque value."""
+
+    def __init__(self, value, is_error=False):
+        self.value = value
+        self.is_error = is_error
+
+
+def _run(coro):
+    return asyncio.new_event_loop().run_until_complete(coro)
+
+
+def _counting_call_next(counter):
+    async def call_next(context):
+        counter[context.message.name] = counter.get(context.message.name, 0) + 1
+        return _FakeToolResult((context.message.name, counter[context.message.name]))
+    return call_next
+
+
+def test_repeat_read_without_mutation_is_served_from_cache():
+    mw = bms.BlenderStateCacheMiddleware(cacheable={"get_scene_info"}, ttl=30)
+    counter = {}
+    call_next = _counting_call_next(counter)
+    ctx = _FakeToolContext("get_scene_info", {"limit": 20})
+    r1 = _run(mw.on_call_tool(ctx, call_next))
+    r2 = _run(mw.on_call_tool(ctx, call_next))
+    assert r1.value == r2.value, "identical reads should share one cache entry"
+    assert counter["get_scene_info"] == 1, "second read should NOT have reached Blender again"
+
+
+def test_mutation_invalidates_the_cached_read():
+    """The exact scenario proven live in the review against a fake Blender
+    addon: a cached read must not be served again once an intervening
+    mutating tool call has run, even with identical arguments and well
+    inside the TTL. Before this fix, two identical get_scene_info() calls
+    around a create_object() both returned call_number 1 — the second read
+    never reached Blender at all."""
+    mw = bms.BlenderStateCacheMiddleware(cacheable={"get_scene_info"}, ttl=30)
+    counter = {}
+    call_next = _counting_call_next(counter)
+    read_ctx = _FakeToolContext("get_scene_info", {"limit": 20})
+    write_ctx = _FakeToolContext("create_object", {"type": "cube"})
+
+    r1 = _run(mw.on_call_tool(read_ctx, call_next))
+    _run(mw.on_call_tool(write_ctx, call_next))  # mutation in between, same key untouched
+    r2 = _run(mw.on_call_tool(read_ctx, call_next))
+
+    assert r1.value != r2.value, "cache served pre-mutation state after a write"
+    assert counter["get_scene_info"] == 2, "the post-mutation read should hit Blender again"
+
+
+def test_run_tool_itself_also_invalidates_the_cache():
+    """run_tool is not in the cacheable set (same as every tool this server
+    cannot classify as a pure state read), so a mutation dispatched THROUGH
+    run_tool must still bump the generation and invalidate prior reads —
+    this is what keeps review defect #1's fix correct even though run_tool
+    bypasses the cache's own lookup/store path for whatever it dispatches
+    internally (review defect #4)."""
+    mw = bms.BlenderStateCacheMiddleware(cacheable={"get_scene_info"}, ttl=30)
+    counter = {}
+    call_next = _counting_call_next(counter)
+    read_ctx = _FakeToolContext("get_scene_info", {"limit": 20})
+    run_tool_ctx = _FakeToolContext("run_tool", {"name": "create_object", "arguments": {"type": "cube"}})
+
+    r1 = _run(mw.on_call_tool(read_ctx, call_next))
+    _run(mw.on_call_tool(run_tool_ctx, call_next))
+    r2 = _run(mw.on_call_tool(read_ctx, call_next))
+
+    assert r1.value != r2.value
+
+
+def test_different_arguments_use_different_cache_entries():
+    mw = bms.BlenderStateCacheMiddleware(cacheable={"get_scene_info"}, ttl=30)
+    counter = {}
+    call_next = _counting_call_next(counter)
+    r1 = _run(mw.on_call_tool(_FakeToolContext("get_scene_info", {"limit": 20}), call_next))
+    r2 = _run(mw.on_call_tool(_FakeToolContext("get_scene_info", {"limit": 50}), call_next))
+    assert r1.value != r2.value
+    assert counter["get_scene_info"] == 2
+
+
+def test_error_results_are_never_cached():
+    mw = bms.BlenderStateCacheMiddleware(cacheable={"get_scene_info"}, ttl=30)
+
+    async def erroring_call_next(context):
+        return _FakeToolResult("boom", is_error=True)
+
+    ctx = _FakeToolContext("get_scene_info", {"limit": 20})
+    _run(mw.on_call_tool(ctx, erroring_call_next))
+
+    async def fresh_call_next(context):
+        return _FakeToolResult("fresh", is_error=False)
+
+    r2 = _run(mw.on_call_tool(ctx, fresh_call_next))
+    assert r2.value == "fresh", "an error result must not be served from the cache on retry"
+
+
+def test_ttl_expiry_forces_a_fresh_read():
+    mw = bms.BlenderStateCacheMiddleware(cacheable={"get_scene_info"}, ttl=30)
+    counter = {}
+    call_next = _counting_call_next(counter)
+    ctx = _FakeToolContext("get_scene_info", {"limit": 20})
+    _run(mw.on_call_tool(ctx, call_next))
+    # Force the stored entry into the past rather than sleeping 30s in a test.
+    key = ("get_scene_info", mw._args_key({"limit": 20}))
+    _expires_at, generation, cached_result = mw._store[key]
+    mw._store[key] = (0.0, generation, cached_result)
+    _run(mw.on_call_tool(ctx, call_next))
+    assert counter["get_scene_info"] == 2
+
+
+def test_cacheable_allowlist_and_readonly_annotation_never_drift_apart():
+    """Review defect #2: `_cacheable_tools()` and the readOnlyHint/
+    idempotentHint annotation used to be two independently hand-maintained
+    prefix lists that disagreed on 16 bim_get_*/bim_list_*/bim_query_elements
+    tools — the annotation called them unsafe to retry while the cache
+    middleware correctly served them from a TTL cache. Both are now built
+    from the same _STATE_READ_PREFIXES/_STATE_READ_NAMES pair; this pins the
+    invariant so an edit to one without the other fails loudly here instead
+    of shipping a silent re-drift."""
+    for name in bms._cacheable_tools():
+        info = bms._TOOL_INDEX[name]
+        assert info["annotations"]["readOnly"] is True, (
+            f"{name} is cacheable but its own readOnlyHint says otherwise"
+        )
+
+
+def test_all_sixteen_bim_get_list_query_tools_are_readonly():
+    expected = {
+        "bim_get_project_info", "bim_get_spatial_tree", "bim_get_container_elements",
+        "bim_get_psets", "bim_get_attributes", "bim_get_type_info",
+        "bim_get_element_classifications", "bim_get_schedule_info",
+        "bim_get_clash_results", "bim_get_georeferencing",
+        "bim_list_materials", "bim_list_types", "bim_list_classifications",
+        "bim_list_systems", "bim_list_bcf_topics", "bim_query_elements",
+    }
+    assert expected <= set(bms._TOOL_INDEX)
+    for name in expected:
+        assert bms._TOOL_INDEX[name]["annotations"]["readOnly"] is True, name
+
+
+def test_ping_and_viewport_screenshot_stay_out_of_the_cache():
+    """ping's entire job is telling a live connection from a dead one —
+    caching that would serve a stale "still connected" answer after Blender
+    drops off. get_viewport_screenshot has a real side effect (a new file
+    written) on every call. Neither belongs in the cache regardless of
+    matching a read-only prefix/name."""
+    cacheable = bms._cacheable_tools()
+    assert "ping" not in cacheable
+    assert "get_viewport_screenshot" not in cacheable

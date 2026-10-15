@@ -22,6 +22,17 @@ COPY *.py ./
 ENV DESKTOP_HOST=aec-web
 ENV BLENDER_PORT=9876
 
+# Review defect #5 (fastmcp4-ausbau wave 2): standalone fastmcp phones home
+# to PyPI on every start to check for a newer release (default
+# check_for_updates="stable"), confirmed in the startup log as a GET to
+# https://pypi.org/pypi/fastmcp/json — a new, undisclosed outbound
+# dependency this container may run with restricted egress against. The
+# bundled build this replaced never made that call. Disabled outright;
+# FASTMCP_SHOW_SERVER_BANNER=false is the same flag that would otherwise
+# print it, kept off for clean container logs.
+ENV FASTMCP_CHECK_FOR_UPDATES=off
+ENV FASTMCP_SHOW_SERVER_BANNER=false
+
 # Streamable HTTP transport — accessible from any VPN machine
 ENV MCP_TRANSPORT=streamable-http
 ENV FASTMCP_HOST=0.0.0.0
